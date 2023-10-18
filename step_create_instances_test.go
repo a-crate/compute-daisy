@@ -17,6 +17,7 @@ package daisy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -205,5 +206,98 @@ func TestCreateInstancesRun(t *testing.T) {
 	}
 	if err := ci.run(ctx, s); err != createErr {
 		t.Errorf("CreateInstances.run() should have return compute client error: %v != %v", err, createErr)
+	}
+}
+
+func TestCreateInstancesCleanup(t *testing.T) {
+	// At time of writing (after implementing test, before implementing fix for
+	// for timeout and error cases), this test is flaky but fails more often than
+	// not. If it breaks again, multiple runs may be required to reproduce an error.
+	var instancesCreated, instancesDeleted int
+	testcases := []struct{
+		name string
+		wftimeout string
+		testduration time.Duration
+		createFn func(p, z string, i *compute.Instance) error
+		createCalls int
+		deleteFn func(p, z, n string) error
+		expectedDeleteCalls int
+	}{
+		{
+			name: "standard-cleanup",
+			wftimeout: "1ms",
+			testduration: time.Duration(2)*time.Millisecond,
+			createCalls: 1,
+			createFn: func(string, string, *compute.Instance) error { instancesCreated++; return nil },
+			expectedDeleteCalls: 1,
+			deleteFn: func(string, string, string) error { instancesDeleted++; return nil },
+		},
+		{
+			name: "timeout-during-create",
+			wftimeout: "5ms",
+			testduration: time.Duration(10)*time.Millisecond,
+			createCalls: 1,
+			createFn: func(string, string, *compute.Instance) error { instancesCreated++;time.Sleep(time.Duration(6)*time.Millisecond); return nil },
+			expectedDeleteCalls: 1,
+			deleteFn: func(string, string, string) error { instancesDeleted++; return nil },
+		},
+		{
+			name: "error-during-first-create",
+			wftimeout: "1ms",
+			testduration: time.Duration(2)*time.Millisecond,
+			createCalls: 2,
+			createFn: func(string, string, *compute.Instance) error { instancesCreated++; if instancesCreated == 1 { return fmt.Errorf("fake error") }; return nil },
+			expectedDeleteCalls: 1,
+			deleteFn: func(string, string, string) error { instancesDeleted++; return nil },
+		},
+		{
+			name: "error-during-second-create",
+			wftimeout: "1ms",
+			testduration: time.Duration(2)*time.Millisecond,
+			createCalls: 2,
+			createFn: func(string, string, *compute.Instance) error { instancesCreated++; if instancesCreated == 2 { return fmt.Errorf("fake error") }; return nil },
+			expectedDeleteCalls: 1,
+			deleteFn: func(string, string, string) error { instancesDeleted++; return nil },
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T){
+			ctx, cancel := context.WithTimeout(context.Background(), tc.testduration)
+			defer cancel()
+			w := testWorkflow()
+			w.ForceCleanupOnTimeout = true
+			w.DefaultTimeout = tc.wftimeout
+			instancesCreated = 0
+			instancesDeleted = 0
+			w.disks.m = map[string]*Resource{testDisk: {link: fmt.Sprintf("projects/%s/zones/%s/disks/%s",testProject,testZone,testDisk)}}
+			w.networks.m = map[string]*Resource{"default": {link: fmt.Sprintf("projects/%s/global/networks/%s",testProject,testNetwork)}}
+			w.ComputeClient.(*daisyCompute.TestClient).GetProjectFn = func(string) (*compute.Project, error) { return &compute.Project{ Name: testProject }, nil }
+			w.ComputeClient.(*daisyCompute.TestClient).GetZoneFn = func(string, string) (*compute.Zone, error) { return &compute.Zone{ Name: testZone }, nil }
+			w.ComputeClient.(*daisyCompute.TestClient).ListZonesFn = func(string, ...daisyCompute.ListCallOption) ([]*compute.Zone, error) { return []*compute.Zone{{ Name: testZone }}, nil }
+			w.ComputeClient.(*daisyCompute.TestClient).GetMachineTypeFn = func(string, string, string) (*compute.MachineType, error) { return &compute.MachineType{ Name: testMachineType }, nil }
+			w.ComputeClient.(*daisyCompute.TestClient).ListNetworksFn = func(string, ...daisyCompute.ListCallOption) ([]*compute.Network, error) { return []*compute.Network{{ Name: testNetwork }, { Name: "default" }}, nil }
+			w.ComputeClient.(*daisyCompute.TestClient).CreateInstanceFn = tc.createFn
+			w.ComputeClient.(*daisyCompute.TestClient).DeleteInstanceFn = tc.deleteFn
+			s, err := w.NewStep(tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.CreateInstances = &CreateInstances{}
+			for i:=1;i<=tc.createCalls;i++ {
+				instname := fmt.Sprintf("%s-%d", testInstance, i)
+				inst := &Instance{InstanceBase: InstanceBase{Resource: Resource{daisyName: instname}}, Instance: compute.Instance{Name: instname, Disks: []*compute.AttachedDisk{{Source: testDisk}} }}
+				s.CreateInstances.Instances = append(s.CreateInstances.Instances, inst)
+			}
+			err = w.Run(context.Background())
+			for ctx.Err() == nil {
+				// Wait until everything should be created and cleaned up.
+			}
+			if instancesCreated != tc.createCalls {
+				t.Errorf("unexpected number of instance create calls, got %d want %d", instancesCreated, tc.createCalls)
+			}
+			if instancesDeleted != tc.expectedDeleteCalls {
+				t.Errorf("unexpected number of instance delete calls, got %d want %d\nerror from workflow run is: %v", instancesDeleted, tc.expectedDeleteCalls, err)
+			}
+		})
 	}
 }

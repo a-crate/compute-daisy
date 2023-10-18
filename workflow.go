@@ -179,6 +179,10 @@ type Workflow struct {
 	serialControlOutputValuesMx sync.Mutex
 	//Forces cleanup on error of all resources, including those marked with NoCleanup
 	ForceCleanupOnError bool
+	// Allow overruning step timeouts (but not context cancellation) to wait for
+	// run operations to finish. This will ensure that no resource is excluded from
+	// cleanup hooks at the cost of possibly causing infinite hangs.
+	ForceCleanupOnTimeout bool
 	// forceCleanup is set to true when resources should be forced clean, even when NoCleanup is set to true
 	forceCleanup bool
 	// cancelReason provides custom reason when workflow is canceled. f
@@ -673,11 +677,17 @@ func (w *Workflow) runStep(ctx context.Context, s *Step) DError {
 		e <- s.run(ctx)
 	}()
 
-	select {
-	case err := <-e:
-		return err
-	case <-timeout:
-		return s.getTimeoutError()
+	for {
+		select {
+		case err := <-e:
+			return err
+		case <-ctx.Done():
+			return newErr(ctx.Err().Error(), ctx.Err())
+		case <-timeout:
+			if !w.ForceCleanupOnTimeout {
+				return s.getTimeoutError()
+			}
+		}
 	}
 }
 
